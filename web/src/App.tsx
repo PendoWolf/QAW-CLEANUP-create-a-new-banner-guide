@@ -1,26 +1,72 @@
 import { useEffect, useState } from "react";
-import { api, type AppState } from "./api";
+import { api, ApiError, type AppState } from "./api";
+
+type Action = "load" | "increment" | "decrement" | "reset" | "refresh";
 
 // Seam for Pendo. Novus installs the Pendo agent, which provides window.pendo
 // at runtime; this fires a Track Event for each action. No-op when the agent
 // isn't present (local dev), so the app and Playwright mocks both stay simple.
-function trackEvent(name: string) {
-  if (typeof window !== "undefined") {
-    window.pendo?.track?.(`demo-${name}`);
+// Events are sent as `demo-${name}` (e.g. "demo-increment"). Pendo matches
+// these names exactly, so don't rename them.
+function trackEvent(name: Action | "action-failed", props?: Record<string, unknown>) {
+  try {
+    if (typeof window !== "undefined") {
+      window.pendo?.track?.(`demo-${name}`, props);
+    }
+  } catch {
+    // Tracking must never break the app. Without this, run() would show a
+    // tracking error to the user as a failed action.
   }
 }
+
+// Properties sent with each action's success event. `prev` is the state that
+// was on screen when the action started; `next` is the server's response.
+function successProps(action: Action, prev: AppState, next: AppState): Record<string, unknown> {
+  switch (action) {
+    case "load":
+      return { counter: next.counter, lastAction: next.lastAction };
+    case "increment":
+    case "decrement":
+      return { counter: next.counter, previousCounter: prev.counter };
+    case "reset":
+      return { previousCounter: prev.counter, previousLastAction: prev.lastAction };
+    case "refresh":
+      return { counter: next.counter, previousCounter: prev.counter, lastAction: next.lastAction };
+  }
+}
+
+// React StrictMode runs mount effects twice in development, so the initial
+// load would be reported twice. This flag lets run() report only the first
+// one. It lives at module level (not in a ref) so it lasts for the whole page
+// load, however many times App mounts.
+let initialLoadReported = false;
 
 export default function App() {
   const [state, setState] = useState<AppState>({ counter: 0, lastAction: "none" });
   const [error, setError] = useState<string | null>(null);
 
-  const run = async (name: string, fn: () => Promise<AppState>) => {
+  const run = async (name: Action, fn: () => Promise<AppState>) => {
+    const prev = state; // what was on screen when the action started
+    const report = name !== "load" || !initialLoadReported;
+    if (name === "load") initialLoadReported = true;
     try {
       setError(null);
-      setState(await fn());
-      trackEvent(name);
+      const next = await fn();
+      setState(next);
+      if (report) trackEvent(name, successProps(name, prev, next));
     } catch (e) {
-      setError((e as Error).message);
+      const message = (e as Error).message;
+      setError(message);
+      if (report) {
+        trackEvent("action-failed", {
+          action: name,
+          // Truncated to stay well within Pendo's 512-byte limit on properties.
+          errorMessage: message.slice(0, 200),
+          // Only HTTP errors have a status; network failures reject without one.
+          // Sent as a string so it groups as a category in Data Explorer.
+          ...(e instanceof ApiError ? { statusCode: String(e.status) } : {}),
+        });
+      }
     }
   };
 
